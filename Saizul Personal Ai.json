@@ -1,0 +1,396 @@
+{
+  "name": "Saizul Amin - Personal FB Page AI Agent (with Human Takeover)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "saizul-page-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Facebook Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [440, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ——— Messenger event normalize (user message + page echo দুটোই) ———\nconst body = $input.first().json.body || $input.first().json;\nconst entry = body.entry?.[0];\nconst messaging = entry?.messaging?.[0];\nconst pageId = entry?.id || '';\n\nif (!messaging || !messaging.message) {\n  return [{ json: { skip: true } }];\n}\n\nconst message = messaging.message;\nconst isEcho = message.is_echo === true;\n\n// is_echo = পেজ থেকে পাঠানো মেসেজ (হয় AI পাঠিয়েছে, নয়তো সাইজুল নিজে)\n// সাধারণ ইউজার মেসেজে sender = ইউজার, recipient = পেজ\n// echo-তে sender = পেজ, recipient = ইউজার\nlet senderId, userId;\nif (isEcho) {\n  userId = messaging.recipient?.id || '';   // যাকে পাঠানো হয়েছে = কাস্টমার\n  senderId = messaging.sender?.id || '';\n} else {\n  userId = messaging.sender?.id || '';      // যে পাঠিয়েছে = কাস্টমার\n  senderId = userId;\n}\n\nconst messageText = message.text || '';\n\n// attachment হলে টেক্সট ফাঁকা থাকতে পারে\nif (!messageText && !isEcho && !message.attachments) {\n  return [{ json: { skip: true } }];\n}\n\nreturn [{\n  json: {\n    skip: false,\n    isEcho,\n    userId,            // সবসময় কাস্টমারের ID (state key)\n    pageId,\n    messageText,\n    hasAttachment: !!message.attachments,\n    timestamp: Date.now()\n  }\n}];"
+      },
+      "id": "normalize",
+      "name": "Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "valid", "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "false" } }
+          ]
+        }
+      },
+      "id": "valid-check",
+      "name": "Is Valid Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 420]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "filtersUI": {
+          "values": [
+            { "lookupColumn": "user_id", "lookupValue": "={{ $json.userId }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-state",
+      "name": "Get Conversation State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [880, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "is-echo", "leftValue": "={{ $('Normalize Event').first().json.isEcho }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "echo-or-user",
+      "name": "Echo (Page) or User?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1100, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ——— পেজ থেকে আসা echo handle করা ———\n// AI নিজে পাঠালে = ignore। সাইজুল নিজে লিখলে = human mode চালু।\nconst ev = $('Normalize Event').first().json;\nconst stateRows = $('Get Conversation State').all().filter(r => r.json.user_id);\nconst row = stateRows[0]?.json || {};\n\nconst lastAiMsg = (row.last_ai_message || '').trim();\nconst echoText = (ev.messageText || '').trim();\n\n// রিজিউম কমান্ড: সাইজুল চ্যাটে #ai লিখলে AI আবার চালু\nif (echoText.toLowerCase() === '#ai') {\n  return [{ json: { action: 'resume', userId: ev.userId, pageId: ev.pageId } }];\n}\n\n// echo টেক্সট সদ্য পাঠানো AI মেসেজের সাথে মিললে = AI-এর নিজের echo, কিছু করো না\nif (echoText && echoText === lastAiMsg) {\n  return [{ json: { action: 'ignore', userId: ev.userId } }];\n}\n\n// নাহলে এটা সাইজুলের ম্যানুয়াল রিপ্লাই → human mode চালু\nreturn [{ json: { action: 'human_takeover', userId: ev.userId, pageId: ev.pageId, humanText: echoText } }];"
+      },
+      "id": "handle-echo",
+      "name": "Handle Page Echo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 240]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "conditions": [ { "leftValue": "={{ $json.action }}", "rightValue": "human_takeover", "operator": { "type": "string", "operation": "equals" } } ] }, "outputKey": "takeover" },
+            { "conditions": { "conditions": [ { "leftValue": "={{ $json.action }}", "rightValue": "resume", "operator": { "type": "string", "operation": "equals" } } ] }, "outputKey": "resume" }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "echo-switch",
+      "name": "Echo Action Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1540, 240]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["user_id"],
+          "value": {
+            "user_id": "={{ $json.userId }}",
+            "human_mode": "true",
+            "last_human_time": "={{ new Date().toISOString() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "set-human-mode",
+      "name": "Set Human Mode ON",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1780, 160]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["user_id"],
+          "value": {
+            "user_id": "={{ $json.userId }}",
+            "human_mode": "false",
+            "last_human_time": "={{ new Date().toISOString() }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "set-human-mode-off",
+      "name": "Set Human Mode OFF (Resume AI)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1780, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ——— ইউজার মেসেজ: human mode চেক ———\nconst ev = $('Normalize Event').first().json;\nconst stateRows = $('Get Conversation State').all().filter(r => r.json.user_id);\nconst row = stateRows[0]?.json || {};\n\nlet history = [];\ntry { history = JSON.parse(row.conversation_history || '[]'); } catch (e) {}\n\nconst humanMode = row.human_mode === 'true' || row.human_mode === true;\nconst lastHumanTime = row.last_human_time ? new Date(row.last_human_time).getTime() : 0;\n\n// human mode অটো-রিজিউম: সাইজুল ৬ ঘণ্টা নিষ্ক্রিয় থাকলে AI আবার চালু\nconst SIX_HOURS = 6 * 60 * 60 * 1000;\nconst autoResume = humanMode && lastHumanTime && (Date.now() - lastHumanTime > SIX_HOURS);\nconst effectiveHumanMode = humanMode && !autoResume;\n\nhistory.push({ role: 'user', content: ev.messageText || '[একটি ছবি/অ্যাটাচমেন্ট পাঠিয়েছে]' });\nif (history.length > 24) history = history.slice(-24);\n\nreturn [{\n  json: {\n    ...ev,\n    conversationHistory: history,\n    humanMode: effectiveHumanMode,\n    isNew: stateRows.length === 0\n  }\n}];"
+      },
+      "id": "check-human-mode",
+      "name": "Build Context & Check Mode",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 560]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "human-active", "leftValue": "={{ $json.humanMode }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "human-mode-check",
+      "name": "Human Handling This Chat?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1540, 560]
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@gmail.com",
+        "subject": "=💬 নতুন মেসেজ (তুমি হ্যান্ডেল করছ) — {{ $json.userId }}",
+        "emailType": "text",
+        "message": "=তুমি যে কনভার্সেশনটি নিজে হ্যান্ডেল করছ, সেখানে নতুন মেসেজ এসেছে:\n\nUser: {{ $json.userId }}\nমেসেজ: {{ $json.messageText }}\n\nসময়: {{ new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka' }) }}\n\n(AI উত্তর দেয়নি — তুমি নিয়ন্ত্রণে আছ। AI আবার চালু করতে চ্যাটে #ai লেখো।)",
+        "options": {}
+      },
+      "id": "notify-human-active",
+      "name": "Notify Saizul (You're Handling)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1780, 480],
+      "notes": "human mode চালু থাকলে AI রিপ্লাই দেবে না, শুধু সাইজুলকে জানাবে"
+    },
+    {
+      "parameters": {
+        "modelId": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "তুমি সাইজুল আমিনের পার্সোনাল ফেসবুক পেজের AI সহকারী। তুমি সাইজুলের হয়ে তার ফলোয়ার, ভক্ত ও পরিচিতদের মেসেজের উত্তর দাও।\n\nব্যক্তিত্ব ও টোন:\n- বাংলায় উত্তর দাও (কেউ ইংরেজিতে লিখলে ইংরেজিতে)\n- উষ্ণ, বিনয়ী, বন্ধুত্বপূর্ণ ও সম্মানজনক\n- সংক্ষিপ্ত ও স্বাভাবিক রাখো, রোবটিক নয়\n- প্রয়োজনে ইমোজি ব্যবহার করো\n\nতুমি যা করতে পারো:\n- সাধারণ শুভেচ্ছা, ধন্যবাদ, প্রশংসার জবাব\n- সাইজুলের কাজ/কন্টেন্ট সম্পর্কে সাধারণ তথ্য\n- সাধারণ প্রশ্নের উত্তর\n\n⚠️ গুরুত্বপূর্ণ — নিচের বিষয়গুলো ক্রিটিকাল, এগুলোতে নিজে সিদ্ধান্ত নেবে না বরং সাইজুলের কাছে হ্যান্ডওভার করবে:\n- ব্যবসা/কাজের প্রস্তাব, কোলাবরেশন, স্পনসরশিপ, ডিল\n- টাকা-পয়সা, পেমেন্ট, লেনদেন সংক্রান্ত\n- ব্যক্তিগত, সংবেদনশীল বা আবেগপ্রবণ বিষয়\n- কোনো প্রতিশ্রুতি, কমিটমেন্ট বা সিদ্ধান্ত যা শুধু সাইজুল নিতে পারেন\n- অভিযোগ, বিতর্ক বা আইনি বিষয়\n- সাক্ষাৎকার, মিডিয়া বা ইভেন্টের অনুরোধ\n\nএমন কিছু এলে নম্রভাবে বলো যে তুমি বিষয়টি সাইজুলকে জানাচ্ছ এবং তিনি নিজে শীঘ্রই উত্তর দেবেন। তারপর response-এর একদম শেষে আলাদা লাইনে শুধু এই ট্যাগটি যোগ করো (কাস্টমার দেখবে না, কোড সরিয়ে দেবে):\n[HANDOVER]\n\nকখনো নিজেকে সাইজুল বলে দাবি করবে না — তুমি তার AI সহকারী। অনিশ্চিত হলে অনুমান না করে হ্যান্ডওভার করো।"
+            },
+            { "role": "user", "content": "={{ $json.messageText }}" }
+          ]
+        },
+        "options": { "maxTokens": 500, "temperature": 0.7 }
+      },
+      "id": "ai-agent",
+      "name": "AI Agent (as Saizul)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1780, 640],
+      "notes": "OpenAI credential. পুরনো history যোগ করতে চাইলে messages-এ history map করে বসাও।"
+    },
+    {
+      "parameters": {
+        "jsCode": "// AI আউটপুট parse + [HANDOVER] শনাক্ত\nconst aiOut = $input.first().json;\nconst raw = aiOut.content || aiOut.text || aiOut.message?.content || '';\n\nlet needsHandover = /\\[HANDOVER\\]/i.test(raw);\nlet clean = raw.replace(/\\[HANDOVER\\]/ig, '').trim();\n\nconst ctx = $('Build Context & Check Mode').first().json;\nconst history = [...(ctx.conversationHistory || [])];\nhistory.push({ role: 'assistant', content: clean });\n\nreturn [{ json: { ...ctx, aiResponse: clean, needsHandover, conversationHistory: history.slice(-24) } }];"
+      },
+      "id": "parse-response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 640]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v19.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"recipient\": { \"id\": \"{{ $json.userId }}\" },\n  \"messaging_type\": \"RESPONSE\",\n  \"message\": { \"text\": {{ JSON.stringify($json.aiResponse) }} }\n}",
+        "options": {}
+      },
+      "id": "send-reply",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 640],
+      "notes": "FB credential: httpQueryAuth → name=access_token, value=PAGE_ACCESS_TOKEN"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "handover", "leftValue": "={{ $json.needsHandover }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "handover-check",
+      "name": "Critical → Handover?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2220, 820]
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@gmail.com",
+        "subject": "=🚨 ক্রিটিকাল মেসেজ — তোমার রিপ্লাই দরকার ({{ $json.userId }})",
+        "emailType": "text",
+        "message": "=একটি গুরুত্বপূর্ণ মেসেজ এসেছে যেটা তোমার নিজে দেখা দরকার:\n\nUser: {{ $json.userId }}\nকাস্টমারের মেসেজ: {{ $json.messageText }}\n\nAI যা বলেছে: {{ $json.aiResponse }}\n\n👉 এই কনভার্সেশনে গিয়ে তুমি নিজে রিপ্লাই দিলে AI স্বয়ংক্রিয়ভাবে থেমে যাবে।\n(কাজ শেষে AI আবার চালু করতে ওই চ্যাটে #ai লেখো।)\n\nসময়: {{ new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka' }) }}",
+        "options": {}
+      },
+      "id": "notify-critical",
+      "name": "Notify Saizul (Critical)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2440, 760]
+    },
+    {
+      "parameters": {
+        "jsCode": "// state আপডেট data প্রস্তুত\nconst ctx = $('Parse AI Response').first().json;\nreturn [{\n  json: {\n    user_id: ctx.userId,\n    page_id: ctx.pageId || '',\n    conversation_history: JSON.stringify(ctx.conversationHistory || []),\n    last_ai_message: ctx.aiResponse || '',\n    // ক্রিটিকাল হলে human mode চালু করে দাও যাতে AI আর জবাব না দেয়\n    human_mode: ctx.needsHandover ? 'true' : 'false',\n    last_human_time: ctx.needsHandover ? new Date().toISOString() : (ctx.last_human_time || ''),\n    last_contact_time: new Date().toISOString(),\n    is_new: ctx.isNew === true\n  }\n}];"
+      },
+      "id": "prepare-state",
+      "name": "Prepare State Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 640]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "is-new", "leftValue": "={{ $json.is_new }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "new-existing",
+      "name": "New or Existing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2660, 640]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "user_id": "={{ $json.user_id }}",
+            "page_id": "={{ $json.page_id }}",
+            "conversation_history": "={{ $json.conversation_history }}",
+            "last_ai_message": "={{ $json.last_ai_message }}",
+            "human_mode": "={{ $json.human_mode }}",
+            "last_human_time": "={{ $json.last_human_time }}",
+            "last_contact_time": "={{ $json.last_contact_time }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "insert-state",
+      "name": "Insert New State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2880, 560]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["user_id"],
+          "value": {
+            "user_id": "={{ $json.user_id }}",
+            "conversation_history": "={{ $json.conversation_history }}",
+            "last_ai_message": "={{ $json.last_ai_message }}",
+            "human_mode": "={{ $json.human_mode }}",
+            "last_human_time": "={{ $json.last_human_time }}",
+            "last_contact_time": "={{ $json.last_contact_time }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "update-state",
+      "name": "Update State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2880, 720]
+    }
+  ],
+  "connections": {
+    "Facebook Webhook": {
+      "main": [[
+        { "node": "Webhook Response", "type": "main", "index": 0 },
+        { "node": "Normalize Event", "type": "main", "index": 0 }
+      ]]
+    },
+    "Normalize Event": { "main": [[{ "node": "Is Valid Event?", "type": "main", "index": 0 }]] },
+    "Is Valid Event?": { "main": [[{ "node": "Get Conversation State", "type": "main", "index": 0 }], []] },
+    "Get Conversation State": { "main": [[{ "node": "Echo (Page) or User?", "type": "main", "index": 0 }]] },
+    "Echo (Page) or User?": {
+      "main": [
+        [{ "node": "Handle Page Echo", "type": "main", "index": 0 }],
+        [{ "node": "Build Context & Check Mode", "type": "main", "index": 0 }]
+      ]
+    },
+    "Handle Page Echo": { "main": [[{ "node": "Echo Action Switch", "type": "main", "index": 0 }]] },
+    "Echo Action Switch": {
+      "main": [
+        [{ "node": "Set Human Mode ON", "type": "main", "index": 0 }],
+        [{ "node": "Set Human Mode OFF (Resume AI)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Build Context & Check Mode": { "main": [[{ "node": "Human Handling This Chat?", "type": "main", "index": 0 }]] },
+    "Human Handling This Chat?": {
+      "main": [
+        [{ "node": "Notify Saizul (You're Handling)", "type": "main", "index": 0 }],
+        [{ "node": "AI Agent (as Saizul)", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Agent (as Saizul)": { "main": [[{ "node": "Parse AI Response", "type": "main", "index": 0 }]] },
+    "Parse AI Response": {
+      "main": [[
+        { "node": "Send Reply", "type": "main", "index": 0 },
+        { "node": "Critical → Handover?", "type": "main", "index": 0 },
+        { "node": "Prepare State Update", "type": "main", "index": 0 }
+      ]]
+    },
+    "Critical → Handover?": { "main": [[{ "node": "Notify Saizul (Critical)", "type": "main", "index": 0 }], []] },
+    "Prepare State Update": { "main": [[{ "node": "New or Existing?", "type": "main", "index": 0 }]] },
+    "New or Existing?": {
+      "main": [
+        [{ "node": "Insert New State", "type": "main", "index": 0 }],
+        [{ "node": "Update State", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": { "executionOrder": "v1" },
+  "tags": ["facebook", "personal-page", "ai-agent", "human-takeover"]
+}

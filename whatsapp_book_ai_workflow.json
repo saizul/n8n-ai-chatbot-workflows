@@ -1,0 +1,552 @@
+{
+  "name": "WhatsApp - Book Shop AI (Sheet + Image Price Lookup + WooCommerce)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-book-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wa-webhook",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED"
+      },
+      "id": "wa-webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [440, 240]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ——— WhatsApp Cloud API message normalize ———\nconst body = $input.first().json.body || $input.first().json;\n\nconst change = body.entry?.[0]?.changes?.[0]?.value;\nconst msg = change?.messages?.[0];\n\n// যদি message না থাকে (status update ইত্যাদি) → skip\nif (!msg) {\n  return [{ json: { skip: true } }];\n}\n\nconst senderId = msg.from || '';\nconst phoneNumberId = change?.metadata?.phone_number_id || '';\nconst msgType = msg.type || 'text';\n\nlet messageText = '';\nlet imageId = '';\nlet hasImage = false;\n\nif (msgType === 'text') {\n  messageText = msg.text?.body || '';\n} else if (msgType === 'image') {\n  hasImage = true;\n  imageId = msg.image?.id || '';\n  messageText = msg.image?.caption || 'এই বইটির দাম কত?';\n}\n\nreturn [{\n  json: {\n    skip: false,\n    senderId,\n    phoneNumberId,\n    msgType,\n    messageText,\n    imageId,\n    hasImage,\n    channel: 'whatsapp',\n    timestamp: Date.now()\n  }\n}];"
+      },
+      "id": "wa-normalize",
+      "name": "Normalize Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "false" }
+            }
+          ]
+        }
+      },
+      "id": "wa-valid-check",
+      "name": "Is Valid Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "has-image",
+              "leftValue": "={{ $json.hasImage }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        }
+      },
+      "id": "wa-image-or-text",
+      "name": "Image or Text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.imageId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "wa-get-media-url",
+      "name": "Get Media URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 280],
+      "notes": "WhatsApp credential: httpHeaderAuth → Authorization: Bearer YOUR_WHATSAPP_TOKEN"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "id": "wa-download-image",
+      "name": "Download Book Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 280],
+      "notes": "Same WhatsApp Bearer token credential needed to download media binary"
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": "gpt-4o",
+        "text": "এই বইয়ের কভারের ছবি বিশ্লেষণ করো। বইয়ের নাম (title), লেখক (author) এবং যেকোনো দৃশ্যমান তথ্য বের করো। শুধুমাত্র এই JSON ফরম্যাটে উত্তর দাও, অন্য কিছু লিখবে না:\n{\"title\": \"বইয়ের নাম\", \"author\": \"লেখকের নাম\", \"keywords\": \"কভারে দেখা মূল শব্দগুলো\"}",
+        "inputType": "binary",
+        "binaryPropertyName": "data",
+        "options": { "detail": "high" }
+      },
+      "id": "wa-vision-identify",
+      "name": "Identify Book (Vision)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1540, 280],
+      "notes": "OpenAI credential required. GPT-4o vision reads the book cover."
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "products", "mode": "name" },
+        "options": {}
+      },
+      "id": "wa-read-products-img",
+      "name": "Read Product Sheet (for image)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1760, 280],
+      "notes": "Product sheet columns: book_title | author | price | stock | category | description | offer | image_url"
+    },
+    {
+      "parameters": {
+        "jsCode": "// বইয়ের ছবি থেকে চেনা title + sheet মিলিয়ে দাম বের করা\nconst visionRaw = $('Identify Book (Vision)').first().json;\nconst visionText = visionRaw.content || visionRaw.text || visionRaw.message?.content || JSON.stringify(visionRaw);\n\nlet identified = { title: '', author: '', keywords: '' };\ntry {\n  const m = visionText.match(/\\{[\\s\\S]*\\}/);\n  if (m) identified = JSON.parse(m[0]);\n} catch (e) {}\n\nconst products = $('Read Product Sheet (for image)').all().map(r => r.json);\n\n// ——— Fuzzy matching helper ———\nfunction normalize(s) {\n  return (s || '').toString().toLowerCase().replace(/[^a-z0-9\\u0980-\\u09FF ]/g, '').trim();\n}\nfunction score(a, b) {\n  a = normalize(a); b = normalize(b);\n  if (!a || !b) return 0;\n  if (a === b) return 100;\n  if (a.includes(b) || b.includes(a)) return 80;\n  const wordsA = a.split(' ').filter(Boolean);\n  const wordsB = b.split(' ').filter(Boolean);\n  let common = 0;\n  for (const w of wordsA) if (w.length > 2 && wordsB.includes(w)) common++;\n  return (common / Math.max(wordsA.length, 1)) * 70;\n}\n\nconst searchStr = `${identified.title} ${identified.author} ${identified.keywords}`;\nlet best = null, bestScore = 0;\nfor (const p of products) {\n  const titleScore = score(searchStr, p.book_title);\n  const authorScore = score(identified.author, p.author);\n  const total = Math.max(titleScore, titleScore * 0.7 + authorScore * 0.3);\n  if (total > bestScore) { bestScore = total; best = p; }\n}\n\nconst ctx = $('Normalize Message').first().json;\nlet replyContext = '';\nif (best && bestScore >= 40) {\n  replyContext = `কাস্টমার একটি বইয়ের ছবি পাঠিয়েছে। আমরা ছবি থেকে চিনেছি: \"${identified.title}\" (লেখক: ${identified.author})।\\nশিটে মিল পাওয়া বই:\\n- নাম: ${best.book_title}\\n- লেখক: ${best.author}\\n- দাম: ${best.price} টাকা\\n- স্টক: ${best.stock}\\n- অফার: ${best.offer || 'নেই'}\\n- বিবরণ: ${best.description || ''}\\n\\nকাস্টমারকে এই বইয়ের দাম ও তথ্য বন্ধুত্বপূর্ণভাবে জানাও এবং অর্ডার করতে আগ্রহী কিনা জিজ্ঞেস করো।`;\n} else {\n  replyContext = `কাস্টমার একটি বইয়ের ছবি পাঠিয়েছে কিন্তু আমাদের শিটে নিশ্চিতভাবে মিল পাওয়া যায়নি (চেনা গেছে: \"${identified.title}\")। কাস্টমারকে নম্রভাবে বইয়ের সঠিক নাম জিজ্ঞেস করো অথবা জানাও যে আমাদের একজন প্রতিনিধি শীঘ্রই কনফার্ম করে জানাবেন।`;\n}\n\nreturn [{ json: { ...ctx, identified, matchedProduct: best, matchScore: bestScore, replyContext } }];"
+      },
+      "id": "wa-match-book",
+      "name": "Match Book to Sheet",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 280]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "products", "mode": "name" },
+        "options": {}
+      },
+      "id": "wa-read-products-text",
+      "name": "Read Product Sheet (for text)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1100, 540]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "filtersUI": {
+          "values": [
+            { "lookupColumn": "sender_id", "lookupValue": "={{ $('Normalize Message').first().json.senderId }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "wa-get-state",
+      "name": "Get Conversation State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1320, 540]
+    },
+    {
+      "parameters": {
+        "jsCode": "// টেক্সট প্রশ্নের জন্য context তৈরি: product list + history\nconst current = $('Normalize Message').first().json;\nconst products = $('Read Product Sheet (for text)').all().map(r => r.json);\nconst stateRows = $('Get Conversation State').all().filter(r => r.json.sender_id);\n\nlet conversationHistory = [];\nlet orderState = {};\nif (stateRows.length > 0) {\n  conversationHistory = JSON.parse(stateRows[0].json.conversation_history || '[]');\n  orderState = JSON.parse(stateRows[0].json.order_state || '{}');\n}\n\n// Product catalog string (token বাঁচাতে মূল ফিল্ড)\nconst catalog = products.map(p => `• ${p.book_title} | লেখক: ${p.author} | দাম: ${p.price}৳ | স্টক: ${p.stock} | অফার: ${p.offer || 'নেই'}`).join('\\n');\n\nconversationHistory.push({ role: 'user', content: current.messageText });\nif (conversationHistory.length > 20) conversationHistory = conversationHistory.slice(-20);\n\nreturn [{\n  json: {\n    ...current,\n    catalog,\n    conversationHistory,\n    orderState,\n    isNewConversation: stateRows.length === 0\n  }\n}];"
+      },
+      "id": "wa-build-context",
+      "name": "Build Text Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 540]
+    },
+    {
+      "parameters": {
+        "modelId": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "=তুমি একটি বাংলাদেশি বইয়ের দোকানের স্মার্ট WhatsApp কাস্টমার সার্ভিস AI।\n\nতোমার কাজ:\n১. বইয়ের দাম, লেখক, স্টক, অফার, ডেলিভারি সম্পর্কে প্রশ্নের উত্তর দেওয়া — শুধুমাত্র নিচের ক্যাটালগ থেকে।\n২. কাস্টমারকে অর্ডার করতে সাহায্য করা।\n৩. অর্ডার নেওয়ার সময় ধাপে ধাপে সংগ্রহ করো: বইয়ের নাম ও পরিমাণ, কাস্টমারের নাম, ফোন নম্বর, ডেলিভারি ঠিকানা (জেলা + বিস্তারিত), পেমেন্ট পদ্ধতি (বিকাশ/নগদ/ক্যাশ অন ডেলিভারি)।\n৪. সব তথ্য পেলে কনফার্মের আগে রিক্যাপ দাও।\n৫. জটিল অভিযোগ/বিশেষ বিষয় হলে বলো: \"আপনার বিষয়টি আমাদের টিমকে জানাচ্ছি, তারা শীঘ্রই যোগাযোগ করবেন। 🙏\"\n\nনিয়ম:\n- সবসময় বাংলায়, সংক্ষিপ্ত ও বন্ধুত্বপূর্ণ। ইমোজি স্বাভাবিকভাবে।\n- ক্যাটালগে নেই এমন বই থাকলে সৎভাবে জানাও, দাম বানিয়ে বলবে না।\n\n📚 বইয়ের ক্যাটালগ:\n{{ $json.catalog }}\n\nResponse শেষে প্রয়োজনে এই ব্লক যোগ করো (কাস্টমারকে দেখাবে না, কোড আলাদা করবে):\n[ORDER_DATA:{\"stage\":\"collecting\"|\"confirmed\"|\"handover\",\"collected\":{\"product\":\"\",\"qty\":1,\"customer_name\":\"\",\"phone\":\"\",\"address\":\"\",\"district\":\"\",\"payment_method\":\"\",\"notes\":\"\"}}]"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.messageText }}"
+            }
+          ]
+        },
+        "options": { "maxTokens": 600, "temperature": 0.7 }
+      },
+      "id": "wa-ai-agent",
+      "name": "AI Agent (Text)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1760, 540]
+    },
+    {
+      "parameters": {
+        "modelId": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "=তুমি বইয়ের দোকানের WhatsApp AI। কাস্টমার একটি বইয়ের ছবি পাঠিয়েছে। নিচের তথ্য ব্যবহার করে বাংলায় সংক্ষিপ্ত, বন্ধুত্বপূর্ণ উত্তর দাও।\n\n{{ $json.replyContext }}\n\nResponse শেষে প্রয়োজনে যোগ করো:\n[ORDER_DATA:{\"stage\":\"collecting\",\"collected\":{...}}]"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.messageText }}"
+            }
+          ]
+        },
+        "options": { "maxTokens": 400, "temperature": 0.7 }
+      },
+      "id": "wa-ai-image-reply",
+      "name": "AI Reply (Image)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [2200, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// AI response parse — দুই branch (text/image) থেকেই আসতে পারে\nconst aiOut = $input.first().json;\nconst raw = aiOut.content || aiOut.text || aiOut.message?.content || '';\n\nlet clean = raw, orderData = null;\nconst m = raw.match(/\\[ORDER_DATA:(\\{[\\s\\S]*?\\})\\]/);\nif (m) {\n  try { orderData = JSON.parse(m[1]); clean = raw.replace(/\\[ORDER_DATA:\\{[\\s\\S]*?\\}\\]/, '').trim(); } catch (e) {}\n}\n\nconst handoverKeywords = ['টিমকে জানাচ্ছি', 'যোগাযোগ করবেন', 'প্রতিনিধি'];\nlet needsHandover = handoverKeywords.some(k => clean.includes(k)) || orderData?.stage === 'handover';\n\n// context — text হলে Build Text Context, image হলে Match Book\nlet ctx;\ntry { ctx = $('Build Text Context').first().json; }\ncatch (e) { ctx = $('Match Book to Sheet').first().json; }\n\nlet history = ctx.conversationHistory || [{ role: 'user', content: ctx.messageText }];\n\nreturn [{ json: { ...ctx, aiResponse: clean, orderData, needsHandover, conversationHistory: history } }];"
+      },
+      "id": "wa-parse-response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.phoneNumberId }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.senderId }}\",\n  \"type\": \"text\",\n  \"text\": { \"body\": {{ JSON.stringify($json.aiResponse) }} }\n}",
+        "options": {}
+      },
+      "id": "wa-send-reply",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 400],
+      "notes": "WhatsApp Bearer token credential (httpHeaderAuth)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "confirmed", "leftValue": "={{ $json.orderData?.stage }}", "rightValue": "confirmed", "operator": { "type": "string", "operation": "equals" } }
+          ]
+        }
+      },
+      "id": "wa-order-confirmed",
+      "name": "Order Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2640, 600]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-WORDPRESS-SITE.com/wp-json/wc/v3/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"payment_method\": \"cod\",\n  \"payment_method_title\": {{ JSON.stringify($json.orderData.collected.payment_method || 'Cash on Delivery') }},\n  \"set_paid\": false,\n  \"status\": \"pending\",\n  \"billing\": {\n    \"first_name\": {{ JSON.stringify($json.orderData.collected.customer_name || '') }},\n    \"phone\": {{ JSON.stringify($json.orderData.collected.phone || $json.senderId) }},\n    \"address_1\": {{ JSON.stringify($json.orderData.collected.address || '') }},\n    \"city\": {{ JSON.stringify($json.orderData.collected.district || '') }},\n    \"country\": \"BD\"\n  },\n  \"line_items\": [\n    { \"name\": {{ JSON.stringify($json.orderData.collected.product || '') }}, \"quantity\": {{ $json.orderData.collected.qty || 1 }} }\n  ],\n  \"customer_note\": {{ JSON.stringify('WhatsApp Order | ' + $json.senderId + ' | ' + ($json.orderData.collected.notes || '')) }}\n}",
+        "options": {}
+      },
+      "id": "wa-create-order",
+      "name": "Create WooCommerce Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2860, 520],
+      "notes": "WooCommerce: httpBasicAuth → user=Consumer Key, pass=Consumer Secret. Replace site URL."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "handover", "leftValue": "={{ $json.needsHandover }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "wa-handover-check",
+      "name": "Needs Handover?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2640, 800]
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_AGENT_EMAIL@gmail.com",
+        "subject": "=🚨 WhatsApp Handover — {{ $json.senderId }}",
+        "emailType": "text",
+        "message": "=একজন কাস্টমারের জন্য মানব সহায়তা প্রয়োজন।\n\nChannel: WhatsApp\nSender: {{ $json.senderId }}\nশেষ বার্তা: {{ $json.messageText }}\n\nAI Response: {{ $json.aiResponse }}\n\nসময়: {{ new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka' }) }}",
+        "options": {}
+      },
+      "id": "wa-notify-gmail",
+      "name": "Notify Agent (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2860, 780],
+      "notes": "Gmail credential. Replace agent email."
+    },
+    {
+      "parameters": {
+        "jsCode": "// State আপডেটের জন্য ডেটা প্রস্তুত\nconst ctx = $('Parse AI Response').first().json;\nconst history = [...(ctx.conversationHistory || [])];\nhistory.push({ role: 'assistant', content: ctx.aiResponse });\n\nlet orderState = ctx.orderState || {};\nif (ctx.orderData) {\n  orderState = { stage: ctx.orderData.stage, collected: ctx.orderData.collected || orderState.collected || {} };\n}\nif (ctx.orderData?.stage === 'confirmed') orderState = {};\n\nreturn [{\n  json: {\n    sender_id: ctx.senderId,\n    channel: 'whatsapp',\n    phone_number_id: ctx.phoneNumberId || '',\n    conversation_history: JSON.stringify(history.slice(-20)),\n    order_state: JSON.stringify(orderState),\n    last_contact_time: new Date().toISOString(),\n    followup_sent: 'false',\n    is_new: ctx.isNewConversation === true\n  }\n}];"
+      },
+      "id": "wa-prepare-state",
+      "name": "Prepare State Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 360]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "is-new", "leftValue": "={{ $json.is_new }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true" } }
+          ]
+        }
+      },
+      "id": "wa-new-existing",
+      "name": "New or Existing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3080, 360]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sender_id": "={{ $json.sender_id }}",
+            "channel": "={{ $json.channel }}",
+            "phone_number_id": "={{ $json.phone_number_id }}",
+            "conversation_history": "={{ $json.conversation_history }}",
+            "order_state": "={{ $json.order_state }}",
+            "last_contact_time": "={{ $json.last_contact_time }}",
+            "followup_sent": "={{ $json.followup_sent }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "wa-insert-state",
+      "name": "Insert New State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3300, 280]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["sender_id"],
+          "value": {
+            "sender_id": "={{ $json.sender_id }}",
+            "conversation_history": "={{ $json.conversation_history }}",
+            "order_state": "={{ $json.order_state }}",
+            "last_contact_time": "={{ $json.last_contact_time }}",
+            "followup_sent": "={{ $json.followup_sent }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "wa-update-state",
+      "name": "Update State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3300, 440]
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30 }] }
+      },
+      "id": "wa-followup-trigger",
+      "name": "Follow-up Scheduler (30min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 980]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "options": {}
+      },
+      "id": "wa-get-all",
+      "name": "Get All Conversations",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [440, 980]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nconst min30 = 30*60*1000, hr2 = 120*60*1000;\nconst out = [];\nfor (const row of $input.all()) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time || r.channel !== 'whatsapp') continue;\n  const since = now - new Date(r.last_contact_time).getTime();\n  const sent = r.followup_sent === 'true' || r.followup_sent === true;\n  const os = JSON.parse(r.order_state || '{}');\n  const done = os.stage === 'confirmed' || !os.stage;\n  if (since >= min30 && since <= hr2 && !sent && !done) {\n    out.push({ json: { senderId: r.sender_id, phoneNumberId: r.phone_number_id, orderState: os } });\n  }\n}\nreturn out.length ? out : [{ json: { skip: true } }];"
+      },
+      "id": "wa-filter-followup",
+      "name": "Filter Inactive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 980]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "skip", "leftValue": "={{ $json.skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notExists", "singleValue": true } }
+          ]
+        }
+      },
+      "id": "wa-any-followup",
+      "name": "Any to Follow Up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 980]
+    },
+    {
+      "parameters": {
+        "modelId": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "তুমি বইয়ের দোকানের ফলো-আপ AI। কাস্টমার কিছুক্ষণ আগে মেসেজ দিয়ে আর রিপ্লাই দেয়নি। বাংলায় ৩-৪ লাইনের একটি বন্ধুত্বপূর্ণ, প্রেশার-মুক্ত ফলো-আপ মেসেজ লেখো যা কাস্টমারকে পুনরায় এনগেজ করবে এবং সাহায্যের অফার করবে।"
+            },
+            {
+              "role": "user",
+              "content": "=কাস্টমারের অর্ডার অবস্থা: {{ JSON.stringify($json.orderState) }}. ফলো-আপ মেসেজ লেখো।"
+            }
+          ]
+        },
+        "options": { "maxTokens": 200, "temperature": 0.8 }
+      },
+      "id": "wa-gen-followup",
+      "name": "Generate Follow-up",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1100, 980]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.phoneNumberId }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.senderId }}\",\n  \"type\": \"text\",\n  \"text\": { \"body\": {{ JSON.stringify($('Generate Follow-up').first().json.content || $('Generate Follow-up').first().json.text) }} }\n}",
+        "options": {}
+      },
+      "id": "wa-send-followup",
+      "name": "Send Follow-up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 980]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "conversation_state", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["sender_id"],
+          "value": { "sender_id": "={{ $json.senderId }}", "followup_sent": "true" }
+        },
+        "options": {}
+      },
+      "id": "wa-mark-followup",
+      "name": "Mark Follow-up Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1540, 980]
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [[
+        { "node": "Webhook Response", "type": "main", "index": 0 },
+        { "node": "Normalize Message", "type": "main", "index": 0 }
+      ]]
+    },
+    "Normalize Message": { "main": [[{ "node": "Is Valid Message?", "type": "main", "index": 0 }]] },
+    "Is Valid Message?": { "main": [[{ "node": "Image or Text?", "type": "main", "index": 0 }], []] },
+    "Image or Text?": {
+      "main": [
+        [{ "node": "Get Media URL", "type": "main", "index": 0 }],
+        [{ "node": "Read Product Sheet (for text)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Media URL": { "main": [[{ "node": "Download Book Image", "type": "main", "index": 0 }]] },
+    "Download Book Image": { "main": [[{ "node": "Identify Book (Vision)", "type": "main", "index": 0 }]] },
+    "Identify Book (Vision)": { "main": [[{ "node": "Read Product Sheet (for image)", "type": "main", "index": 0 }]] },
+    "Read Product Sheet (for image)": { "main": [[{ "node": "Match Book to Sheet", "type": "main", "index": 0 }]] },
+    "Match Book to Sheet": { "main": [[{ "node": "AI Reply (Image)", "type": "main", "index": 0 }]] },
+    "AI Reply (Image)": { "main": [[{ "node": "Parse AI Response", "type": "main", "index": 0 }]] },
+    "Read Product Sheet (for text)": { "main": [[{ "node": "Get Conversation State", "type": "main", "index": 0 }]] },
+    "Get Conversation State": { "main": [[{ "node": "Build Text Context", "type": "main", "index": 0 }]] },
+    "Build Text Context": { "main": [[{ "node": "AI Agent (Text)", "type": "main", "index": 0 }]] },
+    "AI Agent (Text)": { "main": [[{ "node": "Parse AI Response", "type": "main", "index": 0 }]] },
+    "Parse AI Response": {
+      "main": [[
+        { "node": "Send WhatsApp Reply", "type": "main", "index": 0 },
+        { "node": "Order Confirmed?", "type": "main", "index": 0 },
+        { "node": "Needs Handover?", "type": "main", "index": 0 },
+        { "node": "Prepare State Update", "type": "main", "index": 0 }
+      ]]
+    },
+    "Order Confirmed?": { "main": [[{ "node": "Create WooCommerce Order", "type": "main", "index": 0 }], []] },
+    "Needs Handover?": { "main": [[{ "node": "Notify Agent (Gmail)", "type": "main", "index": 0 }], []] },
+    "Prepare State Update": { "main": [[{ "node": "New or Existing?", "type": "main", "index": 0 }]] },
+    "New or Existing?": {
+      "main": [
+        [{ "node": "Insert New State", "type": "main", "index": 0 }],
+        [{ "node": "Update State", "type": "main", "index": 0 }]
+      ]
+    },
+    "Follow-up Scheduler (30min)": { "main": [[{ "node": "Get All Conversations", "type": "main", "index": 0 }]] },
+    "Get All Conversations": { "main": [[{ "node": "Filter Inactive", "type": "main", "index": 0 }]] },
+    "Filter Inactive": { "main": [[{ "node": "Any to Follow Up?", "type": "main", "index": 0 }]] },
+    "Any to Follow Up?": { "main": [[{ "node": "Generate Follow-up", "type": "main", "index": 0 }], []] },
+    "Generate Follow-up": { "main": [[{ "node": "Send Follow-up", "type": "main", "index": 0 }]] },
+    "Send Follow-up": { "main": [[{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "settings": { "executionOrder": "v1" },
+  "tags": ["whatsapp", "books", "ai-chatbot", "woocommerce"]
+}

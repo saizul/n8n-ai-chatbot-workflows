@@ -1,0 +1,729 @@
+{
+  "name": "AI Customer Support - Facebook & WhatsApp + WordPress Order",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "facebook-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-fb",
+      "name": "Facebook Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-wa",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 500]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "merge-channels",
+      "name": "Merge Channels",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [420, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ——— Normalize incoming message from Facebook or WhatsApp ———\nconst body = $input.first().json;\n\nlet senderId = '';\nlet messageText = '';\nlet channel = 'unknown';\nlet pageId = '';\n\n// ---- Facebook Messenger ----\nif (body.object === 'page' || body.entry) {\n  channel = 'facebook';\n  const entry = body.entry?.[0];\n  pageId = entry?.id || '';\n  const messaging = entry?.messaging?.[0];\n  senderId = messaging?.sender?.id || '';\n  messageText = messaging?.message?.text || '';\n}\n// ---- WhatsApp Business Cloud API ----\nelse if (body.object === 'whatsapp_business_account' || body.entry?.[0]?.changes) {\n  channel = 'whatsapp';\n  const change = body.entry?.[0]?.changes?.[0]?.value;\n  const waMsg = change?.messages?.[0];\n  senderId = waMsg?.from || '';\n  messageText = waMsg?.text?.body || '';\n  pageId = change?.metadata?.phone_number_id || '';\n}\n\nreturn [{\n  json: {\n    senderId,\n    messageText,\n    channel,\n    pageId,\n    timestamp: Date.now(),\n    rawBody: body\n  }\n}];"
+      },
+      "id": "normalize-message",
+      "name": "Normalize Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "table": "conversation_state",
+        "filters": {
+          "conditions": [
+            {
+              "field": "sender_id",
+              "value": "={{ $json.senderId }}"
+            }
+          ]
+        }
+      },
+      "id": "get-conversation-state",
+      "name": "Get Conversation State",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [860, 400],
+      "notes": "Stores conversation history & order collection state. Replace with your DB (Postgres/Airtable/Supabase)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build conversation context\nconst current = $('Normalize Message').first().json;\nconst stateRows = $input.all();\n\nlet conversationHistory = [];\nlet orderState = {};\nlet lastContactTime = null;\n\nif (stateRows.length > 0 && stateRows[0].json.sender_id) {\n  const row = stateRows[0].json;\n  conversationHistory = JSON.parse(row.conversation_history || '[]');\n  orderState = JSON.parse(row.order_state || '{}');\n  lastContactTime = row.last_contact_time;\n}\n\n// Append new message to history\nconversationHistory.push({\n  role: 'user',\n  content: current.messageText\n});\n\n// Keep last 20 messages only\nif (conversationHistory.length > 20) {\n  conversationHistory = conversationHistory.slice(-20);\n}\n\nreturn [{\n  json: {\n    ...current,\n    conversationHistory,\n    orderState,\n    lastContactTime,\n    isNewConversation: stateRows.length === 0 || !stateRows[0].json.sender_id\n  }\n}];"
+      },
+      "id": "build-context",
+      "name": "Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "is-order-stage",
+              "leftValue": "={{ $json.orderState.stage }}",
+              "rightValue": "collecting",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        }
+      },
+      "id": "check-order-stage",
+      "name": "Is Order Collection Active?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1300, 400]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "তুমি একটি বাংলাদেশি ই-কমার্স শপের স্মার্ট কাস্টমার সার্ভিস AI। তোমার কাজ:\n\n১. পণ্যের দাম, বৈশিষ্ট্য, ডেলিভারি, অফার ও ব্যবহার বিষয়ক প্রশ্নের উত্তর দেওয়া।\n২. কাস্টমারকে অর্ডার করতে সাহায্য করা।\n৩. অর্ডার নেওয়ার সময় ধাপে ধাপে এই তথ্যগুলো সংগ্রহ করা:\n   - পণ্যের নাম ও পরিমাণ\n   - কাস্টমারের নাম\n   - ফোন নম্বর\n   - ডেলিভারি ঠিকানা (জেলা + বিস্তারিত)\n   - পেমেন্ট পদ্ধতি (বিকাশ/নগদ/ক্যাশ অন ডেলিভারি)\n\n৪. সব তথ্য সংগ্রহ হলে অর্ডার কনফার্ম করার আগে একবার সব তথ্য রিক্যাপ করো।\n৫. জটিল সমস্যা বা অভিযোগ হলে বলো: \"আপনার বিষয়টি আমাদের টিমকে জানাচ্ছি, তারা শীঘ্রই আপনার সাথে যোগাযোগ করবেন। 🙏\"\n\nগুরুত্বপূর্ণ নির্দেশনা:\n- সর্বদা বাংলায় উত্তর দাও (যদি না কাস্টমার ইংরেজিতে লেখে)\n- উত্তর সংক্ষিপ্ত ও বন্ধুত্বপূর্ণ রাখো\n- ইমোজি ব্যবহার করো স্বাভাবিকভাবে\n- মিথ্যা বা অনিশ্চিত তথ্য দেবে না\n\nঅর্ডার সংগ্রহের সময় response-এর শেষে এই JSON ব্লক যোগ করো (শুধুমাত্র যখন প্রয়োজন):\n[ORDER_DATA:{\"stage\":\"collecting\"|\"confirmed\"|\"handover\", \"collected\":{...}}]\n\nঅর্ডার কনফার্ম হলে:\n[ORDER_DATA:{\"stage\":\"confirmed\", \"collected\":{\"product\":\"...\",\"qty\":1,\"customer_name\":\"...\",\"phone\":\"...\",\"address\":\"...\",\"district\":\"...\",\"payment_method\":\"...\",\"notes\":\"...\"}}]"
+            },
+            {
+              "role": "={{ $json.conversationHistory.slice(0,-1).map(m => ({role: m.role, content: m.content})) }}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.messageText }}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 600,
+          "temperature": 0.7
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Agent (GPT-4o-mini)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1520, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "তুমি অর্ডার তথ্য সংগ্রহকারী AI। বর্তমানে কাস্টমার অর্ডার দিচ্ছে। নিচের তথ্য যা এখনো সংগ্রহ হয়নি তা জিজ্ঞেস করো:\n- পণ্যের নাম ও পরিমাণ\n- কাস্টমারের নাম\n- ফোন নম্বর\n- ডেলিভারি ঠিকানা (জেলা + বিস্তারিত)\n- পেমেন্ট পদ্ধতি\n\nবর্তমান সংগৃহীত তথ্য: {{ JSON.stringify($json.orderState.collected || {}) }}\n\nএকবারে একটি প্রশ্ন করো। সব তথ্য পেলে কনফার্ম করার আগে রিক্যাপ দাও।\n\nResponse শেষে সবসময় যোগ করো:\n[ORDER_DATA:{\"stage\":\"collecting\"|\"confirmed\", \"collected\":{...updated_data...}}]"
+            },
+            {
+              "role": "={{ $json.conversationHistory.slice(0,-1).map(m => ({role: m.role, content: m.content})) }}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.messageText }}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 500,
+          "temperature": 0.5
+        }
+      },
+      "id": "order-collection-agent",
+      "name": "Order Collection Agent",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1520, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response & extract ORDER_DATA if present\nconst aiOutput = $input.first().json;\nconst rawResponse = aiOutput.choices?.[0]?.message?.content || aiOutput.message?.content || '';\n\nlet cleanResponse = rawResponse;\nlet orderData = null;\n\n// Extract [ORDER_DATA:{...}] block\nconst orderMatch = rawResponse.match(/\\[ORDER_DATA:(\\{.*?\\})\\]/s);\nif (orderMatch) {\n  try {\n    orderData = JSON.parse(orderMatch[1]);\n    cleanResponse = rawResponse.replace(/\\[ORDER_DATA:\\{.*?\\}\\]/s, '').trim();\n  } catch (e) {\n    // JSON parse failed, ignore\n  }\n}\n\n// Check for handover keywords\nconst handoverKeywords = ['টিমকে জানাচ্ছি', 'এজেন্ট', 'handover', 'যোগাযোগ করবেন'];\nconst needsHandover = handoverKeywords.some(kw => cleanResponse.includes(kw));\n\n// Merge with original context\nconst ctx = $('Build Context').first().json;\n\nreturn [{\n  json: {\n    ...ctx,\n    aiResponse: cleanResponse,\n    orderData,\n    needsHandover,\n    rawAiResponse: rawResponse\n  }\n}];"
+      },
+      "id": "parse-ai-response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1740, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "order-confirmed",
+              "leftValue": "={{ $json.orderData?.stage }}",
+              "rightValue": "confirmed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "is-order-confirmed",
+      "name": "Is Order Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1960, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-WORDPRESS-SITE.com/wp-json/wc/v3/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"payment_method\": \"{{ $json.orderData.collected.payment_method === 'ক্যাশ অন ডেলিভারি' ? 'cod' : 'bacs' }}\",\n  \"payment_method_title\": \"{{ $json.orderData.collected.payment_method }}\",\n  \"set_paid\": false,\n  \"status\": \"pending\",\n  \"billing\": {\n    \"first_name\": \"{{ $json.orderData.collected.customer_name }}\",\n    \"phone\": \"{{ $json.orderData.collected.phone }}\",\n    \"address_1\": \"{{ $json.orderData.collected.address }}\",\n    \"city\": \"{{ $json.orderData.collected.district }}\",\n    \"country\": \"BD\"\n  },\n  \"shipping\": {\n    \"first_name\": \"{{ $json.orderData.collected.customer_name }}\",\n    \"address_1\": \"{{ $json.orderData.collected.address }}\",\n    \"city\": \"{{ $json.orderData.collected.district }}\",\n    \"country\": \"BD\"\n  },\n  \"line_items\": [\n    {\n      \"name\": \"{{ $json.orderData.collected.product }}\",\n      \"quantity\": {{ $json.orderData.collected.qty || 1 }},\n      \"price\": \"0\"\n    }\n  ],\n  \"customer_note\": \"Source: {{ $json.channel }} | Sender: {{ $json.senderId }} | Notes: {{ $json.orderData.collected.notes || '' }}\"\n}",
+        "options": {}
+      },
+      "id": "create-wordpress-order",
+      "name": "Create WordPress WooCommerce Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2180, 280],
+      "notes": "Replace YOUR-WORDPRESS-SITE.com with your actual domain. Add WooCommerce Consumer Key/Secret in credentials."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "needs-handover",
+              "leftValue": "={{ $json.needsHandover }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "id": "needs-handover-check",
+      "name": "Needs Human Handover?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2180, 480]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🚨 *মানব সহায়তা প্রয়োজন!*\n\n📱 Channel: {{ $json.channel }}\n👤 Sender ID: {{ $json.senderId }}\n💬 শেষ বার্তা: {{ $json.messageText }}\n\n🤖 AI Response: {{ $json.aiResponse }}\n\n⏰ সময়: {{ new Date().toLocaleString('bn-BD', {timeZone: 'Asia/Dhaka'}) }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "notify-agent-telegram",
+      "name": "Notify Agent (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2400, 460],
+      "notes": "Replace YOUR_TELEGRAM_CHAT_ID. Add Telegram Bot credentials."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "is-facebook",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "facebook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "route-by-channel",
+      "name": "Route by Channel",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2180, 660]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"recipient\": { \"id\": \"{{ $json.senderId }}\" },\n  \"message\": { \"text\": \"{{ $json.aiResponse.replace(/\"/g, '\\\\\"') }}\" }\n}",
+        "options": {}
+      },
+      "id": "send-facebook-reply",
+      "name": "Send Facebook Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2400, 620],
+      "notes": "Add Facebook Page Access Token in credentials (httpQueryAuth → name: access_token)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.pageId }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.senderId }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"body\": \"{{ $json.aiResponse.replace(/\"/g, '\\\\\"') }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "send-whatsapp-reply",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2400, 700],
+      "notes": "Add WhatsApp Business API Bearer Token in credentials (httpHeaderAuth → Authorization: Bearer YOUR_TOKEN)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update conversation state in Google Sheets\nconst ctx = $('Parse AI Response').first().json;\n\nconst updatedHistory = [...ctx.conversationHistory];\n// Add AI response to history\nupdatedHistory.push({\n  role: 'assistant',\n  content: ctx.aiResponse\n});\n\n// Determine new order state\nlet newOrderState = ctx.orderState || {};\nif (ctx.orderData) {\n  newOrderState = {\n    stage: ctx.orderData.stage,\n    collected: ctx.orderData.collected || newOrderState.collected || {}\n  };\n}\n\n// If order confirmed, clear the order state\nif (ctx.orderData?.stage === 'confirmed') {\n  newOrderState = {};\n}\n\nreturn [{\n  json: {\n    sender_id: ctx.senderId,\n    channel: ctx.channel,\n    conversation_history: JSON.stringify(updatedHistory.slice(-20)),\n    order_state: JSON.stringify(newOrderState),\n    last_contact_time: new Date().toISOString(),\n    is_new: ctx.isNewConversation\n  }\n}];"
+      },
+      "id": "prepare-state-update",
+      "name": "Prepare State Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2620, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "is-new-row",
+              "leftValue": "={{ $json.is_new }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "id": "new-or-existing",
+      "name": "New or Existing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2840, 400]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "conversation_state",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "sender_id": "={{ $json.sender_id }}",
+            "channel": "={{ $json.channel }}",
+            "conversation_history": "={{ $json.conversation_history }}",
+            "order_state": "={{ $json.order_state }}",
+            "last_contact_time": "={{ $json.last_contact_time }}"
+          }
+        }
+      },
+      "id": "insert-new-state",
+      "name": "Insert New Conversation",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3060, 340],
+      "notes": "Replace YOUR_GOOGLE_SHEET_ID"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "conversation_state",
+        "filters": {
+          "conditions": [
+            {
+              "field": "sender_id",
+              "value": "={{ $json.sender_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "conversation_history": "={{ $json.conversation_history }}",
+            "order_state": "={{ $json.order_state }}",
+            "last_contact_time": "={{ $json.last_contact_time }}"
+          }
+        }
+      },
+      "id": "update-existing-state",
+      "name": "Update Existing Conversation",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3060, 460],
+      "notes": "Replace YOUR_GOOGLE_SHEET_ID"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "followup-trigger",
+      "name": "Follow-up Scheduler (Every 30min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 800]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "conversation_state",
+        "filters": {}
+      },
+      "id": "get-all-conversations",
+      "name": "Get All Conversations",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [420, 800]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter conversations that need follow-up:\n// - Last contact was 30-120 min ago\n// - No reply since then (we track this via a 'followup_sent' flag)\n// - Conversation was not fully resolved\n\nconst now = Date.now();\nconst thirtyMin = 30 * 60 * 1000;\nconst twoHours = 120 * 60 * 1000;\n\nconst rows = $input.all();\nconst needFollowUp = [];\n\nfor (const row of rows) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time) continue;\n\n  const lastContact = new Date(r.last_contact_time).getTime();\n  const timeSince = now - lastContact;\n  const followupSent = r.followup_sent === 'true' || r.followup_sent === true;\n  const orderState = JSON.parse(r.order_state || '{}');\n  const isCompleted = orderState.stage === 'confirmed' || !orderState.stage;\n\n  // Send follow-up if: 30-120 min gap, not yet sent, not completed\n  if (timeSince >= thirtyMin && timeSince <= twoHours && !followupSent && !isCompleted) {\n    needFollowUp.push({\n      json: {\n        senderId: r.sender_id,\n        channel: r.channel,\n        orderState,\n        rowData: r\n      }\n    });\n  }\n}\n\nreturn needFollowUp.length > 0 ? needFollowUp : [{ json: { skip: true } }];"
+      },
+      "id": "filter-followup",
+      "name": "Filter Inactive Conversations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 800]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ]
+        }
+      },
+      "id": "skip-if-none",
+      "name": "Any to Follow Up?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 800]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "তুমি একটি বাংলাদেশি ই-কমার্স শপের ফলো-আপ AI। কাস্টমার কিছুক্ষণ আগে মেসেজ দিয়েছিল কিন্তু এখন রিপ্লাই দেয়নি। একটি বন্ধুত্বপূর্ণ ও সংক্ষিপ্ত ফলো-আপ মেসেজ লেখো (বাংলায়) যা:\n1. কাস্টমারকে পুনরায় এনগেজ করবে\n2. যদি অর্ডার প্রক্রিয়া চলছিল তাহলে সেটা মনে করিয়ে দেবে\n3. সাহায্যের অফার করবে\n4. স্বাভাবিক ও প্রেশার-মুক্ত টোনে লিখবে\n\nমেসেজ ৩-৪ লাইনের বেশি না।"
+            },
+            {
+              "role": "user",
+              "content": "=কাস্টমারের বর্তমান অর্ডার অবস্থা: {{ JSON.stringify($json.orderState) }}. একটি ফলো-আপ মেসেজ লেখো।"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 200,
+          "temperature": 0.8
+        }
+      },
+      "id": "generate-followup-msg",
+      "name": "Generate Follow-up Message",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [1080, 860]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "followup-channel",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "facebook",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "route-followup",
+      "name": "Route Follow-up",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1300, 860]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v19.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"recipient\": { \"id\": \"{{ $json.senderId }}\" },\n  \"message\": { \"text\": \"{{ $('Generate Follow-up Message').first().json.choices[0].message.content.replace(/\"/g, '\\\\\"') }}\" }\n}",
+        "options": {}
+      },
+      "id": "send-fb-followup",
+      "name": "Send FB Follow-up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 820]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.rowData.page_id || 'YOUR_PHONE_NUMBER_ID' }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.senderId }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"body\": \"{{ $('Generate Follow-up Message').first().json.choices[0].message.content.replace(/\"/g, '\\\\\"') }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "send-wa-followup",
+      "name": "Send WA Follow-up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 900]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": "YOUR_GOOGLE_SHEET_ID",
+        "sheetName": "conversation_state",
+        "filters": {
+          "conditions": [
+            {
+              "field": "sender_id",
+              "value": "={{ $json.senderId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "followup_sent": "=true"
+          }
+        }
+      },
+      "id": "mark-followup-sent",
+      "name": "Mark Follow-up Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1740, 860]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}"
+      },
+      "id": "webhook-response-fb",
+      "name": "Webhook Response (FB)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [440, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"status\": \"ok\"}"
+      },
+      "id": "webhook-response-wa",
+      "name": "Webhook Response (WA)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [440, 600]
+    }
+  ],
+  "connections": {
+    "Facebook Webhook": {
+      "main": [
+        [
+          { "node": "Webhook Response (FB)", "type": "main", "index": 0 },
+          { "node": "Normalize Message", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          { "node": "Webhook Response (WA)", "type": "main", "index": 0 },
+          { "node": "Normalize Message", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Normalize Message": {
+      "main": [
+        [{ "node": "Get Conversation State", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get Conversation State": {
+      "main": [
+        [{ "node": "Build Context", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Context": {
+      "main": [
+        [{ "node": "Is Order Collection Active?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Order Collection Active?": {
+      "main": [
+        [{ "node": "Order Collection Agent", "type": "main", "index": 0 }],
+        [{ "node": "AI Agent (GPT-4o-mini)", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Agent (GPT-4o-mini)": {
+      "main": [
+        [{ "node": "Parse AI Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Order Collection Agent": {
+      "main": [
+        [{ "node": "Parse AI Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          { "node": "Is Order Confirmed?", "type": "main", "index": 0 },
+          { "node": "Route by Channel", "type": "main", "index": 0 },
+          { "node": "Prepare State Update", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Is Order Confirmed?": {
+      "main": [
+        [{ "node": "Create WordPress WooCommerce Order", "type": "main", "index": 0 }],
+        [{ "node": "Needs Human Handover?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Needs Human Handover?": {
+      "main": [
+        [{ "node": "Notify Agent (Telegram)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Route by Channel": {
+      "main": [
+        [{ "node": "Send Facebook Reply", "type": "main", "index": 0 }],
+        [{ "node": "Send WhatsApp Reply", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare State Update": {
+      "main": [
+        [{ "node": "New or Existing?", "type": "main", "index": 0 }]
+      ]
+    },
+    "New or Existing?": {
+      "main": [
+        [{ "node": "Insert New Conversation", "type": "main", "index": 0 }],
+        [{ "node": "Update Existing Conversation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Follow-up Scheduler (Every 30min)": {
+      "main": [
+        [{ "node": "Get All Conversations", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get All Conversations": {
+      "main": [
+        [{ "node": "Filter Inactive Conversations", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter Inactive Conversations": {
+      "main": [
+        [{ "node": "Any to Follow Up?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Any to Follow Up?": {
+      "main": [
+        [],
+        [{ "node": "Generate Follow-up Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Generate Follow-up Message": {
+      "main": [
+        [{ "node": "Route Follow-up", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route Follow-up": {
+      "main": [
+        [{ "node": "Send FB Follow-up", "type": "main", "index": 0 }],
+        [{ "node": "Send WA Follow-up", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send FB Follow-up": {
+      "main": [
+        [{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send WA Follow-up": {
+      "main": [
+        [{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["ecommerce", "ai-chatbot", "facebook", "whatsapp", "wordpress", "woocommerce"],
+  "triggerCount": 3,
+  "updatedAt": "2026-06-11T00:00:00.000Z",
+  "versionId": "1.0.0"
+}
