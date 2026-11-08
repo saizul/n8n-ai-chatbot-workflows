@@ -29,18 +29,6 @@
     },
     {
       "parameters": {
-        "mode": "combine",
-        "combinationMode": "mergeByPosition",
-        "options": {}
-      },
-      "id": "merge-channels",
-      "name": "Merge Channels",
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 3,
-      "position": [420, 400]
-    },
-    {
-      "parameters": {
         "jsCode": "// ——— Normalize incoming message from Facebook or WhatsApp ———\nconst body = $input.first().json;\n\nlet senderId = '';\nlet messageText = '';\nlet channel = 'unknown';\nlet pageId = '';\n\n// ---- Facebook Messenger ----\nif (body.object === 'page' || body.entry) {\n  channel = 'facebook';\n  const entry = body.entry?.[0];\n  pageId = entry?.id || '';\n  const messaging = entry?.messaging?.[0];\n  senderId = messaging?.sender?.id || '';\n  messageText = messaging?.message?.text || '';\n}\n// ---- WhatsApp Business Cloud API ----\nelse if (body.object === 'whatsapp_business_account' || body.entry?.[0]?.changes) {\n  channel = 'whatsapp';\n  const change = body.entry?.[0]?.changes?.[0]?.value;\n  const waMsg = change?.messages?.[0];\n  senderId = waMsg?.from || '';\n  messageText = waMsg?.text?.body || '';\n  pageId = change?.metadata?.phone_number_id || '';\n}\n\nreturn [{\n  json: {\n    senderId,\n    messageText,\n    channel,\n    pageId,\n    timestamp: Date.now(),\n    rawBody: body\n  }\n}];"
       },
       "id": "normalize-message",
@@ -310,7 +298,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Update conversation state in Google Sheets\nconst ctx = $('Parse AI Response').first().json;\n\nconst updatedHistory = [...ctx.conversationHistory];\n// Add AI response to history\nupdatedHistory.push({\n  role: 'assistant',\n  content: ctx.aiResponse\n});\n\n// Determine new order state\nlet newOrderState = ctx.orderState || {};\nif (ctx.orderData) {\n  newOrderState = {\n    stage: ctx.orderData.stage,\n    collected: ctx.orderData.collected || newOrderState.collected || {}\n  };\n}\n\n// If order confirmed, clear the order state\nif (ctx.orderData?.stage === 'confirmed') {\n  newOrderState = {};\n}\n\nreturn [{\n  json: {\n    sender_id: ctx.senderId,\n    channel: ctx.channel,\n    conversation_history: JSON.stringify(updatedHistory.slice(-20)),\n    order_state: JSON.stringify(newOrderState),\n    last_contact_time: new Date().toISOString(),\n    is_new: ctx.isNewConversation\n  }\n}];"
+        "jsCode": "// Update conversation state in Google Sheets\nconst ctx = $('Parse AI Response').first().json;\n\nconst updatedHistory = [...ctx.conversationHistory];\n// Add AI response to history\nupdatedHistory.push({\n  role: 'assistant',\n  content: ctx.aiResponse\n});\n\n// Determine new order state\nlet newOrderState = ctx.orderState || {};\nif (ctx.orderData) {\n  newOrderState = {\n    stage: ctx.orderData.stage,\n    collected: ctx.orderData.collected || newOrderState.collected || {}\n  };\n}\n\n// If order confirmed, clear the order state\nif (ctx.orderData?.stage === 'confirmed') {\n  newOrderState = {};\n}\n\nreturn [{\n  json: {\n    sender_id: ctx.senderId,\n    channel: ctx.channel,\n    page_id: ctx.pageId || '',\n    conversation_history: JSON.stringify(updatedHistory.slice(-20)),\n    order_state: JSON.stringify(newOrderState),\n    last_contact_time: new Date().toISOString(),\n    followup_sent: 'false',\n    is_new: ctx.isNewConversation\n  }\n}];"
       },
       "id": "prepare-state-update",
       "name": "Prepare State Update",
@@ -350,9 +338,11 @@
           "value": {
             "sender_id": "={{ $json.sender_id }}",
             "channel": "={{ $json.channel }}",
+            "page_id": "={{ $json.page_id }}",
             "conversation_history": "={{ $json.conversation_history }}",
             "order_state": "={{ $json.order_state }}",
-            "last_contact_time": "={{ $json.last_contact_time }}"
+            "last_contact_time": "={{ $json.last_contact_time }}",
+            "followup_sent": "={{ $json.followup_sent }}"
           }
         }
       },
@@ -381,7 +371,8 @@
           "value": {
             "conversation_history": "={{ $json.conversation_history }}",
             "order_state": "={{ $json.order_state }}",
-            "last_contact_time": "={{ $json.last_contact_time }}"
+            "last_contact_time": "={{ $json.last_contact_time }}",
+            "followup_sent": "={{ $json.followup_sent }}"
           }
         }
       },
