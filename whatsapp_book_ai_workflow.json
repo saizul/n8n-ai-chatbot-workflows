@@ -416,7 +416,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const now = Date.now();\nconst min30 = 30*60*1000, hr2 = 120*60*1000;\nconst out = [];\nfor (const row of $input.all()) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time || r.channel !== 'whatsapp') continue;\n  const since = now - new Date(r.last_contact_time).getTime();\n  const sent = r.followup_sent === 'true' || r.followup_sent === true;\n  const os = JSON.parse(r.order_state || '{}');\n  const done = os.stage === 'confirmed' || !os.stage;\n  if (since >= min30 && since <= hr2 && !sent && !done) {\n    out.push({ json: { senderId: r.sender_id, phoneNumberId: r.phone_number_id, orderState: os } });\n  }\n}\nreturn out.length ? out : [{ json: { skip: true } }];"
+        "jsCode": "// order_state is a JSON string kept in the sheet; a hand-edited or truncated cell must not\n// crash the whole follow-up run, so treat anything unreadable as \"no order in progress\".\nconst safeParse = (s) => {\n  try { const v = JSON.parse(s || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }\n  catch (e) { return {}; }\n};\nconst now = Date.now();\nconst min30 = 30*60*1000, hr2 = 120*60*1000;\nconst out = [];\nfor (const row of $input.all()) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time || r.channel !== 'whatsapp') continue;\n  const since = now - new Date(r.last_contact_time).getTime();\n  const sent = r.followup_sent === 'true' || r.followup_sent === true;\n  const os = safeParse(r.order_state);\n  const done = os.stage === 'confirmed' || !os.stage;\n  if (since >= min30 && since <= hr2 && !sent && !done) {\n    out.push({ json: { senderId: r.sender_id, phoneNumberId: r.phone_number_id, orderState: os } });\n  }\n}\nreturn out.length ? out : [{ json: { skip: true } }];"
       },
       "id": "wa-filter-followup",
       "name": "Filter Inactive",
@@ -495,6 +495,88 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4,
       "position": [1540, 980]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp-book-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d3af9bdd-dbd9-5717-9e45-24a30ac9edac",
+      "name": "WhatsApp Webhook (GET verify)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 1280],
+      "webhookId": "c5df005b-1a34-5e72-ba78-2275e114187e",
+      "notes": "Meta calls this once with hub.mode, hub.verify_token and hub.challenge when you save the webhook URL."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "mode",
+              "leftValue": "={{ $json.query['hub.mode'] }}",
+              "rightValue": "subscribe",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "token",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "YOUR_VERIFY_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6723ff81-f16c-5024-a19b-c1b46be40de5",
+      "name": "WhatsApp: Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 1280],
+      "notes": "Replace YOUR_VERIFY_TOKEN with the same random string you enter as Verify Token in the Meta app."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "cb991faa-05d5-5b9f-b160-6333807bd0e6",
+      "name": "WhatsApp: Return Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 1200]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "eb32a250-9a35-563e-8f7f-c614bc0697c1",
+      "name": "WhatsApp: Reject Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 1360]
     }
   ],
   "connections": {
@@ -544,7 +626,9 @@
     "Filter Inactive": { "main": [[{ "node": "Any to Follow Up?", "type": "main", "index": 0 }]] },
     "Any to Follow Up?": { "main": [[{ "node": "Generate Follow-up", "type": "main", "index": 0 }], []] },
     "Generate Follow-up": { "main": [[{ "node": "Send Follow-up", "type": "main", "index": 0 }]] },
-    "Send Follow-up": { "main": [[{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]] }
+    "Send Follow-up": { "main": [[{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]] },
+    "WhatsApp Webhook (GET verify)": { "main": [[{ "node": "WhatsApp: Verify Token OK?", "type": "main", "index": 0 }]] },
+    "WhatsApp: Verify Token OK?": { "main": [[{ "node": "WhatsApp: Return Challenge", "type": "main", "index": 0 }], [{ "node": "WhatsApp: Reject Verification", "type": "main", "index": 0 }]] }
   },
   "pinData": {},
   "settings": { "executionOrder": "v1" },

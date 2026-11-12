@@ -18,3 +18,5 @@ jobs:
           node-version: 20
       - name: Validate n8n workflow JSON
         run: node scripts/validate-workflows.js
+      - name: Unit-test Code node logic
+        run: node --test test/*.test.js
