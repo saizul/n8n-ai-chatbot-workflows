@@ -21,14 +21,27 @@ All credentials, IDs and addresses in the JSON files are placeholders (`YOUR_GOO
 4. Create the Google Sheet tabs described below. Column headers must match exactly.
 5. Copy the production URL of the webhook node (`https://<your-n8n-host>/webhook/<path>`) into your Meta app's webhook settings, then activate the workflow.
 
-Meta also verifies a webhook URL with a `GET` request carrying `hub.challenge`. The webhook nodes in these workflows only accept `POST`, so you need to handle that one-time verification yourself, for example with a small extra `GET` webhook that returns the challenge value, before Meta will deliver messages.
+### Webhook verification (Meta `hub.challenge`)
+
+When you save a callback URL, Meta first sends `GET <url>?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...` and only delivers messages if the URL echoes the challenge. Every workflow now ships with that handshake built in: next to each `POST` webhook there is a `... Webhook (GET verify)` node on the **same path**, a `Verify Token OK?` check and two response nodes.
+
+1. Pick a long random string, for example `openssl rand -hex 24`.
+2. Replace `YOUR_VERIFY_TOKEN` in each `Verify Token OK?` node with it (the e-commerce workflow has one for Facebook and one for WhatsApp).
+3. Activate the workflow, then in the Meta app enter the production URL as **Callback URL** and the same string as **Verify Token**.
+
+A wrong token or a missing `hub.mode=subscribe` gets `403 Forbidden`, so nobody else can subscribe your URL to their app. You can test it yourself:
+
+```bash
+curl "https://<your-n8n-host>/webhook/facebook-webhook?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=12345"
+# -> 12345
+```
 
 Messenger and WhatsApp enforce a 24-hour customer-care window. The follow-up scheduler in these workflows only looks at chats idle for 30 to 120 minutes, but check Meta's current messaging policies before enabling it.
 
 ## 1. `ecommerce_ai_chatbot_workflow.json`
 
 - **Webhooks:** `facebook-webhook` and `whatsapp-webhook` (both `POST`).
-- **Flow:** normalise the message -> load conversation state -> AI agent (`gpt-4o-mini`) or order-collection agent -> if the order is confirmed, `POST` to the WooCommerce REST API -> Telegram alert when the reply signals a handover -> reply on the right channel -> save state. A separate schedule trigger runs every 30 minutes and sends an AI-written follow-up to unfinished order chats.
+- **Flow:** normalise the message (Messenger echoes, delivery/read receipts and WhatsApp status updates are dropped here) -> load conversation state -> AI agent (`gpt-4o-mini`) or order-collection agent -> if the order is confirmed, `POST` to the WooCommerce REST API -> Telegram alert when the reply signals a handover -> reply on the right channel -> save state. A separate schedule trigger runs every 30 minutes and sends an AI-written follow-up to unfinished order chats.
 - **Credentials:** OpenAI; Google Sheets; Telegram bot; Header Auth `Authorization: Bearer <token>` for the WhatsApp Cloud API; Query Auth `access_token` for the Facebook Page; Basic Auth (WooCommerce consumer key as user, secret as password).
 - **Replace:** `YOUR-WORDPRESS-SITE.com` (order node), `YOUR_TELEGRAM_CHAT_ID`, `YOUR_GOOGLE_SHEET_ID`, `YOUR_PHONE_NUMBER_ID` (WhatsApp follow-up fallback).
 - **Sheet:** tab `conversation_state` with columns `sender_id | channel | page_id | conversation_history | order_state | last_contact_time | followup_sent`.
@@ -60,15 +73,20 @@ Messenger and WhatsApp enforce a 24-hour customer-care window. The follow-up sch
 - **Replace:** `YOUR_GOOGLE_SHEET_ID`, `YOUR_EMAIL@gmail.com`.
 - **Sheet:** tab `conversation_state` with columns `user_id | page_id | conversation_history | last_ai_message | human_mode | last_human_time | last_contact_time`.
 
-## Validation
+## Validation and tests
 
-`scripts/validate-workflows.js` checks every workflow JSON in the repo: it must parse, every node needs a unique name, type and position, connections must point to existing nodes, no node may be left unconnected, and no API keys, bearer tokens or hard-coded secrets may be embedded. It runs on every push and pull request (see `.github/workflows/validate.yml`) and locally with:
+`scripts/validate-workflows.js` checks every workflow JSON in the repo: it must parse, every node needs a unique name, type and position, connections must point to existing nodes, no node may be left unconnected, Code node JavaScript must compile, every `POST` webhook needs its `GET` verification twin, and no API keys, bearer tokens or hard-coded secrets may be embedded.
+
+`test/` unit-tests the logic inside the Code nodes without an n8n instance: `test/helpers.js` runs a node's `jsCode` with stubbed `$input` / `$('Node')` and a frozen clock. The tests cover message normalisation for Messenger and WhatsApp, `[ORDER_DATA:{...}]` extraction and handover detection, the 30-120 minute follow-up window, and the human-takeover logic of the personal page bot.
+
+Both run on every push and pull request (see `.github/workflows/validate.yml`) and locally with:
 
 ```bash
 node scripts/validate-workflows.js
+node --test test/*.test.js
 ```
 
-No dependencies are needed beyond Node.js 18 or newer.
+No dependencies are needed beyond Node.js 20 or newer.
 
 ## Author
 

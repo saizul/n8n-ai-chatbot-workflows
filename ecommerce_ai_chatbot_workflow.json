@@ -29,7 +29,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// ——— Normalize incoming message from Facebook or WhatsApp ———\nconst body = $input.first().json;\n\nlet senderId = '';\nlet messageText = '';\nlet channel = 'unknown';\nlet pageId = '';\n\n// ---- Facebook Messenger ----\nif (body.object === 'page' || body.entry) {\n  channel = 'facebook';\n  const entry = body.entry?.[0];\n  pageId = entry?.id || '';\n  const messaging = entry?.messaging?.[0];\n  senderId = messaging?.sender?.id || '';\n  messageText = messaging?.message?.text || '';\n}\n// ---- WhatsApp Business Cloud API ----\nelse if (body.object === 'whatsapp_business_account' || body.entry?.[0]?.changes) {\n  channel = 'whatsapp';\n  const change = body.entry?.[0]?.changes?.[0]?.value;\n  const waMsg = change?.messages?.[0];\n  senderId = waMsg?.from || '';\n  messageText = waMsg?.text?.body || '';\n  pageId = change?.metadata?.phone_number_id || '';\n}\n\nreturn [{\n  json: {\n    senderId,\n    messageText,\n    channel,\n    pageId,\n    timestamp: Date.now(),\n    rawBody: body\n  }\n}];"
+        "jsCode": "// ——— Normalize incoming message from Facebook or WhatsApp ———\n// The Webhook node (v2) puts the request payload under `body`.\nconst body = $input.first().json.body || $input.first().json;\n\nlet senderId = '';\nlet messageText = '';\nlet channel = 'unknown';\nlet pageId = '';\n\n// ---- WhatsApp Business Cloud API (check first: its payload also has `entry`) ----\nif (body.object === 'whatsapp_business_account' || body.entry?.[0]?.changes) {\n  channel = 'whatsapp';\n  const change = body.entry?.[0]?.changes?.[0]?.value;\n  const waMsg = change?.messages?.[0];\n  senderId = waMsg?.from || '';\n  messageText = waMsg?.text?.body || waMsg?.button?.text || waMsg?.interactive?.button_reply?.title || '';\n  pageId = change?.metadata?.phone_number_id || '';\n}\n// ---- Facebook Messenger ----\nelse if (body.object === 'page' || body.entry?.[0]?.messaging) {\n  channel = 'facebook';\n  const entry = body.entry?.[0];\n  pageId = entry?.id || '';\n  const messaging = entry?.messaging?.[0];\n  // Echoes are the Page's own replies; answering them would make the bot talk to itself.\n  if (messaging?.message?.is_echo) return [];\n  senderId = messaging?.sender?.id || '';\n  messageText = messaging?.message?.text || messaging?.postback?.title || '';\n}\n\n// Delivery/read receipts, WhatsApp status updates and stickers carry no text: stop here.\nif (!senderId || !messageText.trim()) return [];\n\nreturn [{\n  json: {\n    senderId,\n    messageText,\n    channel,\n    pageId,\n    timestamp: Date.now(),\n    rawBody: body\n  }\n}];"
       },
       "id": "normalize-message",
       "name": "Normalize Message",
@@ -415,7 +415,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Filter conversations that need follow-up:\n// - Last contact was 30-120 min ago\n// - No reply since then (we track this via a 'followup_sent' flag)\n// - Conversation was not fully resolved\n\nconst now = Date.now();\nconst thirtyMin = 30 * 60 * 1000;\nconst twoHours = 120 * 60 * 1000;\n\nconst rows = $input.all();\nconst needFollowUp = [];\n\nfor (const row of rows) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time) continue;\n\n  const lastContact = new Date(r.last_contact_time).getTime();\n  const timeSince = now - lastContact;\n  const followupSent = r.followup_sent === 'true' || r.followup_sent === true;\n  const orderState = JSON.parse(r.order_state || '{}');\n  const isCompleted = orderState.stage === 'confirmed' || !orderState.stage;\n\n  // Send follow-up if: 30-120 min gap, not yet sent, not completed\n  if (timeSince >= thirtyMin && timeSince <= twoHours && !followupSent && !isCompleted) {\n    needFollowUp.push({\n      json: {\n        senderId: r.sender_id,\n        channel: r.channel,\n        orderState,\n        rowData: r\n      }\n    });\n  }\n}\n\nreturn needFollowUp.length > 0 ? needFollowUp : [{ json: { skip: true } }];"
+        "jsCode": "// order_state is a JSON string kept in the sheet; a hand-edited or truncated cell must not\n// crash the whole follow-up run, so treat anything unreadable as \"no order in progress\".\nconst safeParse = (s) => {\n  try { const v = JSON.parse(s || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }\n  catch (e) { return {}; }\n};\n// Filter conversations that need follow-up:\n// - Last contact was 30-120 min ago\n// - No reply since then (we track this via a 'followup_sent' flag)\n// - Conversation was not fully resolved\n\nconst now = Date.now();\nconst thirtyMin = 30 * 60 * 1000;\nconst twoHours = 120 * 60 * 1000;\n\nconst rows = $input.all();\nconst needFollowUp = [];\n\nfor (const row of rows) {\n  const r = row.json;\n  if (!r.sender_id || !r.last_contact_time) continue;\n\n  const lastContact = new Date(r.last_contact_time).getTime();\n  const timeSince = now - lastContact;\n  const followupSent = r.followup_sent === 'true' || r.followup_sent === true;\n  const orderState = safeParse(r.order_state);\n  const isCompleted = orderState.stage === 'confirmed' || !orderState.stage;\n\n  // Send follow-up if: 30-120 min gap, not yet sent, not completed\n  if (timeSince >= thirtyMin && timeSince <= twoHours && !followupSent && !isCompleted) {\n    needFollowUp.push({\n      json: {\n        senderId: r.sender_id,\n        channel: r.channel,\n        orderState,\n        rowData: r\n      }\n    });\n  }\n}\n\nreturn needFollowUp.length > 0 ? needFollowUp : [{ json: { skip: true } }];"
       },
       "id": "filter-followup",
       "name": "Filter Inactive Conversations",
@@ -574,6 +574,170 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
       "position": [440, 600]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "facebook-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "3e64e234-0c9a-54bc-a39d-40f5428e606b",
+      "name": "Facebook Webhook (GET verify)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 1200],
+      "webhookId": "21ae35c7-92b2-5c41-b7b2-30877628e821",
+      "notes": "Meta calls this once with hub.mode, hub.verify_token and hub.challenge when you save the webhook URL."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "mode",
+              "leftValue": "={{ $json.query['hub.mode'] }}",
+              "rightValue": "subscribe",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "token",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "YOUR_VERIFY_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5da2ed50-fd96-5ea1-a28e-8156166e7499",
+      "name": "Facebook: Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [420, 1200],
+      "notes": "Replace YOUR_VERIFY_TOKEN with the same random string you enter as Verify Token in the Meta app."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1811f398-4321-5394-9bf5-68c42917fc63",
+      "name": "Facebook: Return Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 1120]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "b8af4f77-8170-5cf8-b9d7-2ec6dbd445a7",
+      "name": "Facebook: Reject Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 1280]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "daa5d03c-28c4-5038-abf5-b5e38e8a06f2",
+      "name": "WhatsApp Webhook (GET verify)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 1460],
+      "webhookId": "efdefffc-fd7b-5c43-8293-e4dc3b6fd79a",
+      "notes": "Meta calls this once with hub.mode, hub.verify_token and hub.challenge when you save the webhook URL."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "mode",
+              "leftValue": "={{ $json.query['hub.mode'] }}",
+              "rightValue": "subscribe",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "token",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "YOUR_VERIFY_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "752703a3-6009-5e65-a7c9-6668d2ec5204",
+      "name": "WhatsApp: Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [420, 1460],
+      "notes": "Replace YOUR_VERIFY_TOKEN with the same random string you enter as Verify Token in the Meta app."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "5ad1a786-1d7c-597b-b64b-054bbd3c5d2f",
+      "name": "WhatsApp: Return Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 1380]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "940ea125-2e93-5f40-a063-9943c68906a1",
+      "name": "WhatsApp: Reject Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 1540]
     }
   ],
   "connections": {
@@ -703,7 +867,11 @@
       "main": [
         [{ "node": "Mark Follow-up Sent", "type": "main", "index": 0 }]
       ]
-    }
+    },
+    "Facebook Webhook (GET verify)": { "main": [[{ "node": "Facebook: Verify Token OK?", "type": "main", "index": 0 }]] },
+    "Facebook: Verify Token OK?": { "main": [[{ "node": "Facebook: Return Challenge", "type": "main", "index": 0 }], [{ "node": "Facebook: Reject Verification", "type": "main", "index": 0 }]] },
+    "WhatsApp Webhook (GET verify)": { "main": [[{ "node": "WhatsApp: Verify Token OK?", "type": "main", "index": 0 }]] },
+    "WhatsApp: Verify Token OK?": { "main": [[{ "node": "WhatsApp: Return Challenge", "type": "main", "index": 0 }], [{ "node": "WhatsApp: Reject Verification", "type": "main", "index": 0 }]] }
   },
   "pinData": {},
   "settings": {

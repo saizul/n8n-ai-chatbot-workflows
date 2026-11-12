@@ -340,6 +340,88 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4,
       "position": [2880, 720]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "saizul-page-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "440218fa-7747-56a7-8ffa-79b2b98717d9",
+      "name": "Facebook Webhook (GET verify)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 1120],
+      "webhookId": "48c4005c-6a7b-57ca-9800-636b799fd13d",
+      "notes": "Meta calls this once with hub.mode, hub.verify_token and hub.challenge when you save the webhook URL."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "mode",
+              "leftValue": "={{ $json.query['hub.mode'] }}",
+              "rightValue": "subscribe",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "token",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "YOUR_VERIFY_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ea54abe2-c8f8-515f-9531-4ceaeb36dc3f",
+      "name": "Facebook: Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 1120],
+      "notes": "Replace YOUR_VERIFY_TOKEN with the same random string you enter as Verify Token in the Meta app."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "75334460-a820-5328-8088-ed080adc59ef",
+      "name": "Facebook: Return Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 1040]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "2db319bf-1695-567e-9d05-48a32b3964d7",
+      "name": "Facebook: Reject Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 1200]
     }
   ],
   "connections": {
@@ -388,7 +470,9 @@
         [{ "node": "Insert New State", "type": "main", "index": 0 }],
         [{ "node": "Update State", "type": "main", "index": 0 }]
       ]
-    }
+    },
+    "Facebook Webhook (GET verify)": { "main": [[{ "node": "Facebook: Verify Token OK?", "type": "main", "index": 0 }]] },
+    "Facebook: Verify Token OK?": { "main": [[{ "node": "Facebook: Return Challenge", "type": "main", "index": 0 }], [{ "node": "Facebook: Reject Verification", "type": "main", "index": 0 }]] }
   },
   "pinData": {},
   "settings": { "executionOrder": "v1" },
